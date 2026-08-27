@@ -40,7 +40,7 @@ use probe_rs::{
     architecture::arm::{
         ArmCommunicationInterface, ArmDebugInterface, ArmError, DapError, DapProbe, RawDapAccess,
         RegisterAddress,
-        dp::{DpRegister, RdBuff},
+        dp::{Abort, DpRegister, RdBuff},
         sequences::ArmDebugSequence,
     },
     probe::{
@@ -280,6 +280,96 @@ impl LinuxSpidevSwdProbe {
 
         Ok(())
     }
+
+    /// Read a block, retrying WAIT responses the way the shared transfer layer does.
+    ///
+    /// The RP2350 reset sequence pokes RESCUE_RESTART and then reads back over the
+    /// debug port while the chip's debug subsystem is still reinitializing, so an AP
+    /// transfer briefly returns WAIT. A single WAIT otherwise wedges the link: without
+    /// a sticky-bit clear every following transfer stays WAIT. This mirrors
+    /// `perform_raw_transfers_retry` in the core crate: retry up to
+    /// `num_retries_after_wait`, clear the DP sticky bits between tries with a widening
+    /// idle backoff, and issue a final DAP abort if the link never recovers.
+    fn read_block_retry(
+        &mut self,
+        address: RegisterAddress,
+        values: &mut [u32],
+    ) -> Result<(), ArmError> {
+        for backoff in self.wait_backoff() {
+            match self.raw_read_block_internal(address, values) {
+                Ok(()) => return Ok(()),
+                Err(ArmError::Dap(DapError::WaitResponse)) => self.recover_after_wait(backoff)?,
+                Err(e) => return Err(e),
+            }
+        }
+        self.dap_abort()?;
+        Err(ArmError::Dap(DapError::WaitResponse))
+    }
+
+    /// Write a block, retrying WAIT responses. See [`Self::read_block_retry`].
+    fn write_block_retry(
+        &mut self,
+        address: RegisterAddress,
+        values: &[u32],
+    ) -> Result<(), ArmError> {
+        for backoff in self.wait_backoff() {
+            match self.raw_write_block_internal(address, values) {
+                Ok(()) => return Ok(()),
+                Err(ArmError::Dap(DapError::WaitResponse)) => self.recover_after_wait(backoff)?,
+                Err(e) => return Err(e),
+            }
+        }
+        self.dap_abort()?;
+        Err(ArmError::Dap(DapError::WaitResponse))
+    }
+
+    /// The per-attempt idle backoff, in whole SPI bytes, that doubles up to the cap.
+    fn wait_backoff(&self) -> impl Iterator<Item = usize> + use<> {
+        wait_backoff_bytes(
+            self.swd_settings.num_retries_after_wait,
+            self.swd_settings.max_retry_idle_cycles_after_wait,
+        )
+    }
+
+    /// Clear the DP sticky overrun/error bits and space out the next attempt.
+    fn recover_after_wait(&mut self, idle_bytes: usize) -> Result<(), ArmError> {
+        tracing::debug!("SWD WAIT: clearing DP sticky bits, backing off {idle_bytes} idle byte(s)");
+        let mut abort = Abort::default();
+        abort.set_orunerrclr(true);
+        abort.set_stkerrclr(true);
+        self.write_abort(abort)?;
+        self.idle_clocks(idle_bytes)
+    }
+
+    /// Abort the current AP transaction after WAITs never cleared, as ADI requires.
+    fn dap_abort(&mut self) -> Result<(), ArmError> {
+        let mut abort = Abort::default();
+        abort.set_dapabort(true);
+        self.write_abort(abort)
+    }
+
+    /// Write the DP ABORT register, ignoring the ACK.
+    ///
+    /// ABORT exists to recover a link that is refusing transfers, so a WAIT or FAULT
+    /// on the ABORT itself is not fatal; only an I/O error on the SPI bus is.
+    fn write_abort(&mut self, abort: Abort) -> Result<(), ArmError> {
+        let value: u32 = abort.into();
+        let packet = SwdWritePacket::new(RegisterAddress::DpRegister(Abort::ADDRESS), value);
+        let bytes = packet.0.reverse_bits().to_be_bytes();
+        self.tx_buffer.extend_from_slice(&bytes[0..WRITE_PACKET_SIZE]);
+        // Drain the response without parsing the ACK.
+        for _packet in self.transfer(WRITE_PACKET_SIZE)? {}
+        Ok(())
+    }
+
+    /// Emit idle SWCLK cycles with SWDIO low, to space out a retried transfer.
+    fn idle_clocks(&mut self, bytes: usize) -> Result<(), ArmError> {
+        if bytes == 0 {
+            return Ok(());
+        }
+        self.transfer_raw_bytes(&vec![0u8; bytes])?;
+        Ok(())
+    }
 }
 
 impl DebugProbe for LinuxSpidevSwdProbe {
@@ -433,27 +523,12 @@ fn parse_swd_ack(ack: u64) -> Result<(), DapError> {
 impl RawDapAccess for LinuxSpidevSwdProbe {
     fn raw_read_register(&mut self, address: RegisterAddress) -> Result<u32, ArmError> {
         let mut data = 0;
-        match self.raw_read_block_internal(address, std::slice::from_mut(&mut data)) {
-            Ok(()) => Ok(data),
-            Err(ArmError::Dap(DapError::WaitResponse)) => {
-                tracing::debug!("Read from {address:?} got WAIT response, retrying once");
-                self.raw_read_block_internal(address, std::slice::from_mut(&mut data))?;
-                Ok(data)
-            }
-            Err(e) => Err(e),
-        }
+        self.read_block_retry(address, std::slice::from_mut(&mut data))?;
+        Ok(data)
     }
 
     fn raw_write_register(&mut self, address: RegisterAddress, value: u32) -> Result<(), ArmError> {
-        match self.raw_write_block(address, &[value]) {
-            Ok(()) => Ok(()),
-            Err(ArmError::Dap(DapError::WaitResponse)) => {
-                tracing::debug!("Write to {address:?} got WAIT response, retrying once");
-                self.raw_write_block_internal(address, &[value])?;
-                Ok(())
-            }
-            Err(e) => Err(e),
-        }
+        self.write_block_retry(address, &[value])
     }
 
     fn raw_read_block(
@@ -461,15 +536,7 @@ impl RawDapAccess for LinuxSpidevSwdProbe {
         address: RegisterAddress,
         values: &mut [u32],
     ) -> Result<(), ArmError> {
-        // Flush any queued writes.
-        match self.raw_read_block_internal(address, values) {
-            Ok(()) => Ok(()),
-            Err(ArmError::Dap(DapError::WaitResponse)) => {
-                tracing::debug!("Read from {address:?} got WAIT response, retrying once");
-                self.raw_read_block_internal(address, values)
-            }
-            Err(e) => Err(e),
-        }
+        self.read_block_retry(address, values)
     }
 
     fn raw_write_block(
@@ -477,14 +544,7 @@ impl RawDapAccess for LinuxSpidevSwdProbe {
         address: RegisterAddress,
         values: &[u32],
     ) -> Result<(), ArmError> {
-        match self.raw_write_block_internal(address, values) {
-            Ok(()) => Ok(()),
-            Err(ArmError::Dap(DapError::WaitResponse)) => {
-                tracing::debug!("Write to {address:?} got WAIT response, retrying once");
-                self.raw_write_block_internal(address, values)
-            }
-            Err(e) => Err(e),
-        }
+        self.write_block_retry(address, values)
     }
 
     fn raw_flush(&mut self) -> Result<(), ArmError> {
@@ -645,6 +705,16 @@ fn encode_swj_sequence(bit_len: u8, bits: u64) -> Vec<u8> {
     tx
 }
 
+/// The WAIT-retry backoff schedule, in whole SPI bytes per attempt.
+///
+/// It yields one entry per allowed attempt (at least one), doubling the idle span
+/// from one byte up to the `max_retry_idle_cycles_after_wait` cap rounded to bytes.
+fn wait_backoff_bytes(num_retries: usize, max_idle_cycles: usize) -> impl Iterator<Item = usize> {
+    let retries = num_retries.max(1);
+    let cap = max_idle_cycles.div_ceil(8).max(1);
+    (0..retries).map(move |attempt| (1usize << attempt.min(usize::BITS as usize - 1)).min(cap))
+}
+
 fn is_line_reset_pattern(bit_len: u8, bits: u64) -> bool {
     if bit_len < SWD_LINE_RESET_BITS {
         return false;
@@ -708,6 +778,16 @@ mod tests {
     #[test]
     fn encode_swj_sequence_matches_switch_bytes() {
         assert_eq!(encode_swj_sequence(16, 0xE79E), vec![0x79, 0xE7]);
+    }
+
+    #[test]
+    fn wait_backoff_doubles_then_caps_and_counts_attempts() {
+        // Cap of 128 idle cycles rounds to 16 bytes; the span doubles up to it.
+        let schedule: Vec<usize> = wait_backoff_bytes(1000, 128).take(6).collect();
+        assert_eq!(schedule, vec![1, 2, 4, 8, 16, 16]);
+        // One attempt is always allowed, even when configured retries is zero.
+        assert_eq!(wait_backoff_bytes(0, 128).count(), 1);
+        assert_eq!(wait_backoff_bytes(1000, 128).count(), 1000);
     }
 
     #[test]
