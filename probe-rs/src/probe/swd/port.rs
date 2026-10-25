@@ -128,24 +128,34 @@ impl<'p> SwdPort<'p> {
         let mut idle_cycles = self.settings.num_idle_cycles_between_writes.max(1);
         let max_retries = self.settings.num_retries_after_wait;
 
-        for _ in 0..max_retries {
-            match self.probe.run_batch(&expanded) {
+        let mut stalled = 0;
+        let mut window = expanded.len();
+        let mut recovery = None;
+        while !expanded.is_empty() && stalled < max_retries {
+            let mut pending = SwdBatch::new();
+            let prefix = usize::from(recovery.is_some());
+            if let Some(cycles) = recovery {
+                pending.idle(cycles);
+            }
+            for (id, op) in expanded.iter().take(window) {
+                if id.should_capture() {
+                    pending.schedule_preserved(id.clone(), op.clone());
+                } else {
+                    let _ = pending.schedule(op.clone());
+                }
+            }
+            let sent = pending.len() - prefix;
+            match self.probe.run_batch(&pending) {
                 Ok(results) => {
                     collected.merge_from(results);
-                    let remapped = remap_results(
-                        read_handles,
-                        logical,
-                        &pins_handles,
-                        collected,
-                        &self.block_read_counts,
-                    );
-                    self.block_read_counts.clear();
-                    self.block_read_handles.clear();
-                    drop(pipeline_handles);
-                    return Ok(remapped);
+                    expanded.consume(sent);
+                    stalled = 0;
+                    idle_cycles = self.settings.num_idle_cycles_between_writes.max(1);
+                    recovery = None;
+                    window = window.saturating_mul(2);
                 }
                 Err(error) => {
-                    let fault_index = error.fault_operation;
+                    let fault_index = error.fault_operation.saturating_sub(prefix);
                     collected.merge_from(error.results);
                     let transfer_error = batch_error_to_transfer(&error.error);
 
@@ -164,7 +174,15 @@ impl<'p> SwdPort<'p> {
                                 tracing::debug!("clearing after WAIT failed, retrying: {error:?}");
                             }
                             expanded.consume(fault_index);
-                            bump_write_idle(&mut expanded, idle_cycles as u32);
+                            if fault_index > 0 {
+                                stalled = 0;
+                                idle_cycles = self.settings.num_idle_cycles_between_writes.max(1);
+                            }
+                            stalled += 1;
+                            // Probe only one operation after WAIT, then grow after progress.
+                            // Retrying a long rejected suffix can otherwise have quadratic cost.
+                            window = 1;
+                            recovery = Some(idle_cycles as u32);
                             idle_cycles = idle_cycles
                                 .saturating_mul(2)
                                 .min(self.settings.max_retry_idle_cycles_after_wait);
@@ -178,6 +196,20 @@ impl<'p> SwdPort<'p> {
                     }
                 }
             }
+        }
+
+        if expanded.is_empty() {
+            let remapped = remap_results(
+                read_handles,
+                logical,
+                &pins_handles,
+                collected,
+                &self.block_read_counts,
+            );
+            self.block_read_counts.clear();
+            self.block_read_handles.clear();
+            drop(pipeline_handles);
+            return Ok(remapped);
         }
 
         tracing::debug!(
@@ -418,35 +450,6 @@ fn schedule_transfer(
             let _ = batch.schedule(op);
         }
     }
-}
-
-fn bump_write_idle(batch: &mut SwdBatch, extra: u32) {
-    let remaining = batch.remaining_with_ids();
-    let mut modified = Vec::with_capacity(remaining.len());
-    let mut index = 0;
-    while index < remaining.len() {
-        let (id, op) = remaining[index].clone();
-        modified.push((id, op.clone()));
-        if matches!(
-            op,
-            SwdOp::Transfer {
-                direction: Direction::Write,
-                ..
-            }
-        ) && let Some((idle_id, SwdOp::Idle { cycles })) = remaining.get(index + 1)
-        {
-            modified.push((
-                idle_id.clone(),
-                SwdOp::Idle {
-                    cycles: cycles + extra,
-                },
-            ));
-            index += 2;
-            continue;
-        }
-        index += 1;
-    }
-    batch.replace_remaining(modified);
 }
 
 fn is_ap_read(op: &SwdOp) -> bool {
@@ -804,6 +807,34 @@ mod tests {
         port.run(batch).expect("run should succeed");
 
         assert_eq!(ap_write_count(&probe.transfer_ops()), 1);
+    }
+
+    #[test]
+    fn sustained_backpressure_has_linear_batch_cost_and_a_progress_based_budget() {
+        let settings = SwdSettings {
+            num_retries_after_wait: 2,
+            ..SwdSettings::default()
+        };
+        let mut probe = MockSwdProbe::with_settings(duplicate_settings(&settings));
+        let mut batch = SwdBatch::new();
+        for value in 0..64 {
+            probe.push_response(ScriptedResponse::Wait);
+            push_clear_overrun_ok(&mut probe);
+            probe.push_response(ScriptedResponse::Ok(0));
+            batch.write(Port::Ap, 0xC, value);
+        }
+        SwdPort::new(&mut probe, settings).run(batch).unwrap();
+        let writes: Vec<_> = probe
+            .transfer_ops()
+            .into_iter()
+            .filter(|op| op.port == Port::Ap && op.direction == Direction::Write)
+            .map(|op| op.data)
+            .collect();
+        assert_eq!(
+            writes,
+            (0..64).flat_map(|value| [value, value]).collect::<Vec<_>>()
+        );
+        assert!(probe.batch_lengths.iter().sum::<usize>() < 64 * 12);
     }
 
     #[test]

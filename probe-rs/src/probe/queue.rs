@@ -158,17 +158,6 @@ impl<Op, E: std::error::Error + Send + Sync + 'static> Batch<Op, E> {
     ) -> Handle<CommandResult> {
         self.batch.schedule_preserved(id, cmd)
     }
-
-    pub(crate) fn replace_remaining(&mut self, ops: Vec<(HandleId, Op)>) {
-        self.batch.replace_remaining(ops);
-    }
-
-    pub(crate) fn remaining_with_ids(&self) -> Vec<(HandleId, Op)>
-    where
-        Op: Clone,
-    {
-        self.batch.remaining_with_ids()
-    }
 }
 
 impl<Op, E: std::error::Error + Send + Sync + 'static> Batch<Op, E> {
@@ -381,19 +370,6 @@ impl<T: 'static> Handle<T> {
 pub struct ErasedBatch<Op> {
     commands: Vec<(HandleId, Op)>,
     cursor: usize,
-}
-
-impl<Op: Clone> ErasedBatch<Op> {
-    fn remaining_with_ids(&self) -> Vec<(HandleId, Op)> {
-        self.commands[self.cursor..].to_vec()
-    }
-}
-
-impl<Op> ErasedBatch<Op> {
-    fn replace_remaining(&mut self, ops: Vec<(HandleId, Op)>) {
-        self.commands.truncate(self.cursor);
-        self.commands.extend(ops);
-    }
 }
 
 impl<Op> ErasedBatch<Op> {
