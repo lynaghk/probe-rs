@@ -69,6 +69,7 @@ pub(crate) struct MockSwdProbe {
     pins: Arc<Mutex<Vec<RecordedPins>>>,
     pin_levels: Option<u8>,
     swd_settings: SwdSettings,
+    pub(crate) batch_lengths: Vec<usize>,
 }
 
 impl MockSwdProbe {
@@ -88,6 +89,7 @@ impl MockSwdProbe {
             pins: Arc::new(Mutex::new(Vec::new())),
             pin_levels: None,
             swd_settings: SwdSettings::default(),
+            batch_lengths: Vec::new(),
         }
     }
 
@@ -254,6 +256,7 @@ impl SwdProbe for MockSwdProbe {
         &mut self,
         batch: &SwdBatch,
     ) -> Result<Results, BatchExecutionError<DebugProbeError>> {
+        self.batch_lengths.push(batch.len());
         let mut results = Results::new();
 
         for (fault_operation, (id, op)) in batch.iter().enumerate() {
