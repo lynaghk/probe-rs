@@ -170,8 +170,19 @@ impl RunLoop {
         F: FnMut(HaltReason, &mut Core) -> Result<Option<R>>,
     {
         let start = Instant::now();
-        let core_count = shared_session.session_blocking().target().cores.len();
-        let mut next_wakeup = vec![start; core_count];
+        let mut watches = {
+            let mut session = shared_session.session_blocking();
+            (0..session.target().cores.len())
+                .map(
+                    |index| match session.core(index).and_then(|mut core| core.status()) {
+                        Ok(status) => CoreWatch::WaitingForResume.observe(status),
+                        Err(Error::CoreDisabled(_)) => CoreWatch::WaitingForResume,
+                        Err(_) => CoreWatch::Active,
+                    },
+                )
+                .collect::<Vec<_>>()
+        };
+        let mut next_wakeup = vec![start; watches.len()];
 
         loop {
             let mut next_poll;
@@ -235,6 +246,19 @@ impl RunLoop {
                             continue;
                         }
                     };
+
+                    // RAM loading can deliberately leave secondary cores halted.
+                    // Observe those cores only after firmware resumes them.
+                    if watches[idx] == CoreWatch::WaitingForResume {
+                        if let Ok(status) = core.status() {
+                            watches[idx] = watches[idx].observe(status);
+                        }
+                        if watches[idx] == CoreWatch::WaitingForResume {
+                            *wakeup = Instant::now() + WATCH_POLL_INTERVAL;
+                            next_poll = next_poll.min(WATCH_POLL_INTERVAL);
+                            continue;
+                        }
+                    }
 
                     let mut duration = WATCH_POLL_INTERVAL;
                     match self
@@ -304,6 +328,41 @@ impl RunLoop {
 
             probe_rs::CoreStatus::LockedUp => Some(Ok(ReturnReason::LockedUp)),
         })
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CoreWatch {
+    WaitingForResume,
+    Active,
+}
+
+impl CoreWatch {
+    fn observe(self, status: probe_rs::CoreStatus) -> Self {
+        match (self, status) {
+            (Self::WaitingForResume, probe_rs::CoreStatus::Halted(HaltReason::Request)) => self,
+            _ => Self::Active,
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use probe_rs::CoreStatus;
+
+    #[test]
+    fn a_parked_core_is_watched_after_it_resumes() {
+        let parked = CoreStatus::Halted(HaltReason::Request);
+        let waiting = CoreWatch::WaitingForResume.observe(parked);
+        assert_eq!(waiting, CoreWatch::WaitingForResume);
+        let active = waiting.observe(CoreStatus::Running);
+        assert_eq!(active, CoreWatch::Active);
+        assert_eq!(active.observe(parked), CoreWatch::Active);
+        assert_eq!(
+            waiting.observe(CoreStatus::Halted(HaltReason::Exception)),
+            CoreWatch::Active
+        );
     }
 }
 
