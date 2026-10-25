@@ -37,8 +37,8 @@
 
 use probe_rs::probe::{
     BatchError, BatchExecutionError, BitSequence, CommandResult, DebugProbe, DebugProbeError,
-    DebugProbeInfo, DebugProbeSelector, ProbeCreationError, ProbeError, ProbeFactory, Results,
-    SwdSettings, WireProtocol,
+    DebugProbeInfo, DebugProbeSelector, HandleId, ProbeCreationError, ProbeError, ProbeFactory,
+    Results, SwdSettings, WireProtocol,
     list::ProbeListItem,
     swd::{Direction, Port, SwdBatch, SwdOp, SwdProbe, SwdTransferError},
 };
@@ -308,28 +308,45 @@ impl LinuxSpidevSwdProbe {
         Ok(())
     }
 
-    /// Sends one read as its own transfer. The queue must be empty.
-    fn transfer_read(&mut self, is_ap: bool, addr: u8) -> Result<u32, DebugProbeError> {
+    /// Sends consecutive reads together and retains results before the first failed ACK.
+    /// `SwdPort` owns the AP pipeline and retries from the reported batch index.
+    fn transfer_reads(
+        &mut self,
+        reads: &[(usize, &HandleId, bool, u8)],
+        results: &mut Results,
+    ) -> Result<(), (usize, DebugProbeError)> {
         debug_assert!(self.queue.is_empty());
-        let packet = SwdReadPacket::new(is_ap, addr);
-        let packet = packet.0.reverse_bits().to_be_bytes();
-        let mut tx = packet[0..READ_PACKET_SIZE].to_vec();
+        let mut tx = Vec::new();
+        for &(_, _, is_ap, addr) in reads {
+            let packet = SwdReadPacket::new(is_ap, addr)
+                .0
+                .reverse_bits()
+                .to_be_bytes();
+            tx.extend_from_slice(&packet[..READ_PACKET_SIZE]);
+        }
         tx.extend(std::iter::repeat_n(0u8, self.trailing_idle_bytes()));
         self.bus
-            .transfer(&tx, &mut self.rx_buffer[0..tx.len()])
-            .map_err(io_error)?;
+            .transfer(&tx, &mut self.rx_buffer[..tx.len()])
+            .map_err(|error| (reads[0].0, io_error(error)))?;
 
-        let response = SwdReadPacket(decode_packet(&self.rx_buffer[0..READ_PACKET_SIZE]));
-        parse_swd_ack(response.ack())?;
-
-        let parity = (response.data().count_ones() & 1) == 1;
-        if parity != response.parity2() {
-            return Err(DebugProbeError::SwdTransfer(
-                SwdTransferError::IncorrectParity,
-            ));
+        for (&(index, id, _, _), bytes) in reads.iter().zip(
+            self.rx_buffer[..reads.len() * READ_PACKET_SIZE]
+                .as_chunks::<READ_PACKET_SIZE>()
+                .0,
+        ) {
+            let response = SwdReadPacket(decode_packet(bytes));
+            parse_swd_ack(response.ack()).map_err(|error| (index, error))?;
+            if (response.data().count_ones() & 1 == 1) != response.parity2() {
+                return Err((
+                    index,
+                    DebugProbeError::SwdTransfer(SwdTransferError::IncorrectParity),
+                ));
+            }
+            if id.should_capture() {
+                results.push(id, CommandResult::U32(response.data()));
+            }
         }
-
-        Ok(response.data())
+        Ok(())
     }
 }
 
@@ -414,7 +431,8 @@ impl SwdProbe for LinuxSpidevSwdProbe {
     ) -> Result<Results, BatchExecutionError<DebugProbeError>> {
         let mut results = Results::new();
 
-        for (index, (id, op)) in batch.iter().enumerate() {
+        let mut operations = batch.iter().enumerate().peekable();
+        while let Some((index, (id, op))) = operations.next() {
             let at_index = |error| (index, error);
             let op_result = match op {
                 SwdOp::Transfer {
@@ -429,13 +447,28 @@ impl SwdProbe for LinuxSpidevSwdProbe {
                     direction: Direction::Read,
                     ..
                 } => self.flush_writes(index).and_then(|()| {
-                    let value = self
-                        .transfer_read(*port == Port::Ap, *addr)
-                        .map_err(at_index)?;
-                    if id.should_capture() {
-                        results.push(id, CommandResult::U32(value));
+                    let limit = (MAX_QUEUE_BYTES - self.trailing_idle_bytes()) / READ_PACKET_SIZE;
+                    let mut reads = vec![(index, id, *port == Port::Ap, *addr)];
+                    while reads.len() < limit {
+                        let Some(&(
+                            next_index,
+                            (
+                                next_id,
+                                SwdOp::Transfer {
+                                    port,
+                                    addr,
+                                    direction: Direction::Read,
+                                    ..
+                                },
+                            ),
+                        )) = operations.peek()
+                        else {
+                            break;
+                        };
+                        reads.push((next_index, next_id, *port == Port::Ap, *addr));
+                        operations.next();
                     }
-                    Ok(())
+                    self.transfer_reads(&reads, &mut results)
                 }),
                 SwdOp::Sequence(bits) => self.flush_writes(index).and_then(|()| {
                     self.transfer_raw_bytes(&encode_swj_sequence(bits))
@@ -896,6 +929,85 @@ mod tests {
         assert_eq!(queue.push_idle(MAX_QUEUE_BYTES, 1), MAX_QUEUE_BYTES - 1);
         assert_eq!(queue.room(1), 0);
         assert_eq!(queue.push_idle(8, 1), 0);
+    }
+
+    fn read_reply(ack: u64, value: u32) -> Vec<u8> {
+        let mut packet = SwdReadPacket(0);
+        packet.set_ack(ack);
+        packet.set_data(value);
+        packet.set_parity2(value.count_ones() & 1 == 1);
+        packet.0.reverse_bits().to_be_bytes()[..READ_PACKET_SIZE].to_vec()
+    }
+
+    #[test]
+    fn consecutive_reads_share_a_bounded_transfer() {
+        let bus = FakeBus::new([], READ_PACKET_SIZE);
+        let sent = bus.sent.clone();
+        let mut probe = LinuxSpidevSwdProbe::with_bus(Box::new(bus));
+        let mut batch = SwdBatch::new();
+        let handles: Vec<_> = (0..600).map(|_| batch.read(Port::Ap, 0xC)).collect();
+        let mut results = probe.run_batch(&batch).unwrap();
+        for handle in handles {
+            assert_eq!(results.take(handle).unwrap(), 0);
+        }
+        assert_eq!(*sent.lock().unwrap(), [4096, 106]);
+    }
+
+    #[test]
+    fn read_wait_retains_the_prefix_and_reports_the_exact_retry_position() {
+        for failed in 0..4 {
+            let mut reply = Vec::new();
+            for index in 0..4 {
+                let ack = if index < failed { 0b001 } else { 0b010 };
+                reply.extend(read_reply(ack, 100 + index as u32));
+            }
+            reply.push(0);
+            let mut retry = Vec::new();
+            for index in failed..4 {
+                retry.extend(read_reply(0b001, 100 + index as u32));
+            }
+            retry.push(0);
+            let bus = FakeBus::new([reply, retry], READ_PACKET_SIZE);
+            let mut probe = LinuxSpidevSwdProbe::with_bus(Box::new(bus));
+            let mut batch = SwdBatch::new();
+            let handles: Vec<_> = (0..4).map(|_| batch.read(Port::Ap, 0xC)).collect();
+            let error = probe.run_batch(&batch).unwrap_err();
+            assert_eq!(error.fault_operation, failed);
+            let mut results = error.results;
+            batch.consume(failed);
+            let mut retried = probe.run_batch(&batch).unwrap();
+            for (index, handle) in handles.into_iter().enumerate() {
+                let source = if index < failed {
+                    &mut results
+                } else {
+                    &mut retried
+                };
+                assert_eq!(source.take(handle).unwrap(), 100 + index as u32);
+            }
+        }
+    }
+
+    #[test]
+    fn read_parity_failure_retains_earlier_results() {
+        let mut reply = read_reply(0b001, 1);
+        let mut invalid = SwdReadPacket(decode_packet(&read_reply(0b001, 2)));
+        invalid.set_parity2(!invalid.parity2());
+        reply.extend_from_slice(&invalid.0.reverse_bits().to_be_bytes()[..READ_PACKET_SIZE]);
+        reply.push(0);
+        let mut probe =
+            LinuxSpidevSwdProbe::with_bus(Box::new(FakeBus::new([reply], READ_PACKET_SIZE)));
+        let mut batch = SwdBatch::new();
+        let first = batch.read(Port::Ap, 0xC);
+        let _second = batch.read(Port::Dp, 0xC);
+        let mut error = probe.run_batch(&batch).unwrap_err();
+        assert_eq!(error.fault_operation, 1);
+        assert!(matches!(
+            error.error,
+            BatchError::Specific(DebugProbeError::SwdTransfer(
+                SwdTransferError::IncorrectParity
+            ))
+        ));
+        assert_eq!(error.results.take(first).unwrap(), 1);
     }
 
     #[test]
