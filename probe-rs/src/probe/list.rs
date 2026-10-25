@@ -154,7 +154,12 @@ impl ProbeLister for AllProbesLister {
         let mut open_error = None;
         let mut fallback_error = ProbeCreationError::NotFound;
 
-        for probe_ctor in DRIVERS.read().iter() {
+        let drivers = DRIVERS.read();
+        if let Some(driver) = drivers.iter().find(|driver| driver.owns_selector(selector)) {
+            return driver.open(selector).map(Probe::from_specific_probe);
+        }
+
+        for probe_ctor in drivers.iter() {
             match probe_ctor.open(selector) {
                 Ok(link) => return Ok(Probe::from_specific_probe(link)),
                 Err(DebugProbeError::ProbeCouldNotBeCreated(ProbeCreationError::NotFound)) => {}
@@ -171,7 +176,14 @@ impl ProbeLister for AllProbesLister {
     fn list_with_access(&self, selector: Option<&DebugProbeSelector>) -> Vec<ProbeListItem> {
         let mut list = vec![];
 
-        for driver in DRIVERS.read().iter() {
+        let drivers = DRIVERS.read();
+        if let Some(selector) = selector
+            && let Some(driver) = drivers.iter().find(|driver| driver.owns_selector(selector))
+        {
+            return driver.list_probes_filtered(Some(selector));
+        }
+
+        for driver in drivers.iter() {
             list.extend(driver.list_probes_filtered(selector));
         }
 
@@ -189,6 +201,90 @@ impl AllProbesLister {
     /// Create a new lister with all built-in probe drivers.
     pub const fn new() -> Self {
         Self
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::probe::{DebugProbe, ProbeFactory, fake_probe::FakeProbe};
+
+    #[derive(Debug)]
+    enum TestFactory {
+        Owned,
+        Unrelated,
+    }
+    static OWNED: TestFactory = TestFactory::Owned;
+    static UNRELATED: TestFactory = TestFactory::Unrelated;
+    const SERIAL: &str = "/test/exclusively-owned-probe";
+
+    impl std::fmt::Display for TestFactory {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            write!(f, "{self:?}")
+        }
+    }
+
+    impl ProbeFactory for TestFactory {
+        fn owns_selector(&self, selector: &DebugProbeSelector) -> bool {
+            matches!(self, Self::Owned) && selector.serial_number.as_deref() == Some(SERIAL)
+        }
+
+        fn open(
+            &self,
+            selector: &DebugProbeSelector,
+        ) -> Result<Box<dyn DebugProbe>, DebugProbeError> {
+            if selector.serial_number.as_deref() == Some(SERIAL) {
+                assert!(matches!(self, Self::Owned), "opened an unrelated driver");
+                return Ok(Box::new(FakeProbe::new()));
+            }
+            Err(DebugProbeError::ProbeCouldNotBeCreated(
+                ProbeCreationError::NotFound,
+            ))
+        }
+
+        fn list_probes(&self) -> Vec<ProbeListItem> {
+            Vec::new()
+        }
+
+        fn list_probes_filtered(
+            &self,
+            selector: Option<&DebugProbeSelector>,
+        ) -> Vec<ProbeListItem> {
+            if selector.and_then(|s| s.serial_number.as_deref()) == Some(SERIAL) {
+                assert!(
+                    matches!(self, Self::Owned),
+                    "enumerated an unrelated driver"
+                );
+                return vec![ProbeListItem::accessible(DebugProbeInfo::new(
+                    "Owned test probe",
+                    0,
+                    0,
+                    Some(SERIAL.to_owned()),
+                    &OWNED,
+                    None,
+                    false,
+                ))];
+            }
+            Vec::new()
+        }
+    }
+
+    #[test]
+    fn public_lister_routes_owned_selectors_without_touching_unrelated_drivers() {
+        {
+            let mut drivers = DRIVERS.write();
+            drivers.push(&UNRELATED);
+            drivers.push(&OWNED);
+        }
+        let selector: DebugProbeSelector = format!("0:0:{SERIAL}").parse().unwrap();
+        let lister = Lister::new();
+        let probes = lister.list_with_access(Some(&selector));
+        assert_eq!(probes.len(), 1);
+        assert_eq!(probes[0].info.serial_number.as_deref(), Some(SERIAL));
+        assert_eq!(
+            lister.open(selector).unwrap().get_name(),
+            "Mock probe for testing"
+        );
     }
 }
 

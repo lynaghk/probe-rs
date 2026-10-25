@@ -745,6 +745,14 @@ pub trait ProbeFactory: std::any::Any + std::fmt::Display + std::fmt::Debug + Sy
     /// When opening, it will open the first probe which succeeds during this call.
     fn open(&self, selector: &DebugProbeSelector) -> Result<Box<dyn DebugProbe>, DebugProbeError>;
 
+    /// Whether this factory exclusively owns an explicit, non-USB selector namespace.
+    ///
+    /// The lister routes such selectors directly to this factory without enumerating
+    /// unrelated devices. Return false for selectors that another driver can own.
+    fn owns_selector(&self, _selector: &DebugProbeSelector) -> bool {
+        false
+    }
+
     /// Returns a list of all available debug probes of the current type, each annotated with
     /// whether the current process can access it.
     fn list_probes(&self) -> Vec<list::ProbeListItem>;

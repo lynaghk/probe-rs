@@ -68,6 +68,16 @@ impl std::fmt::Display for LinuxSpidevSwdFactory {
 }
 
 impl ProbeFactory for LinuxSpidevSwdFactory {
+    fn owns_selector(&self, selector: &DebugProbeSelector) -> bool {
+        selector.vendor_id == 0
+            && selector.product_id == 0
+            && selector.interface.is_none()
+            && selector
+                .serial_number
+                .as_deref()
+                .is_some_and(|serial| is_valid_spidev_path(Path::new(serial)))
+    }
+
     fn open(&self, selector: &DebugProbeSelector) -> Result<Box<dyn DebugProbe>, DebugProbeError> {
         let path = find_matching_device(selector)?;
         let spidev = spidev::Spidev::open(&path).map_err(|error| {
@@ -757,6 +767,20 @@ mod tests {
         let selector: DebugProbeSelector = "0:0:/dev/spidev1.0".parse().unwrap();
 
         assert!(selector.matches_probe(&info));
+    }
+
+    #[test]
+    fn only_synthetic_spidev_selectors_are_exclusively_owned() {
+        for (text, expected) in [
+            ("0:0:/dev/spidev0.0", true),
+            ("0:0:/dev/spidev_swd0", true),
+            ("1234:5678:/dev/spidev0.0", false),
+            ("0:0:/dev/ttyUSB0", false),
+            ("0:0:/tmp/spidev0.0", false),
+        ] {
+            let selector = text.parse().unwrap();
+            assert_eq!(LinuxSpidevSwdFactory.owns_selector(&selector), expected);
+        }
     }
 
     #[test]
