@@ -195,12 +195,14 @@ trait SpiBus: Debug + Send {
 
 impl SpiBus for spidev::Spidev {
     fn configure(&mut self, speed_hz: u32) -> std::io::Result<()> {
-        let options = SpidevOptions::new()
-            .bits_per_word(8)
-            .max_speed_hz(speed_hz)
-            .mode(SpiModeFlags::SPI_MODE_3)
-            .build();
-        spidev::Spidev::configure(self, &options)
+        configure_swd_mode(|mode| {
+            let options = SpidevOptions::new()
+                .bits_per_word(8)
+                .max_speed_hz(speed_hz)
+                .mode(mode)
+                .build();
+            spidev::Spidev::configure(self, &options)
+        })
     }
 
     fn transfer(&mut self, tx: &[u8], rx: &mut [u8]) -> std::io::Result<()> {
@@ -208,6 +210,19 @@ impl SpiBus for spidev::Spidev {
         debug_assert_eq!(tx.len(), rx.len());
         let mut transfer = SpidevTransfer::read_write(tx, rx);
         spidev::Spidev::transfer(self, &mut transfer)
+    }
+}
+
+fn configure_swd_mode(
+    mut configure: impl FnMut(SpiModeFlags) -> std::io::Result<()>,
+) -> std::io::Result<()> {
+    // Both modes sample SWDIO on rising edges and change MOSI on falling edges.
+    // BCM2835 AUX (Pi SPI1) rejects CPHA, so it needs mode 0 instead of mode 3.
+    match configure(SpiModeFlags::SPI_MODE_3) {
+        Err(error) if error.kind() == std::io::ErrorKind::InvalidInput => {
+            configure(SpiModeFlags::SPI_MODE_0)
+        }
+        result => result,
     }
 }
 
